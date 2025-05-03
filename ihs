@@ -1,0 +1,116 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import rasterio
+from rasterio.warp import reproject, Resampling
+
+# --- RGB to IHS ---
+def rgb_to_ihs(rgb):
+    R, G, B = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    I = (R + G + B) / 3.0
+    min_val = np.minimum(np.minimum(R, G), B)
+    S = 1 - (3 * min_val / (R + G + B + 1e-6))
+    numerator = 0.5 * ((R - G) + (R - B))
+    denominator = np.sqrt((R - G)**2 + (R - B)*(G - B)) + 1e-6
+    H = np.arccos(numerator / denominator)
+    H[B > G] = (2 * np.pi) - H[B > G]
+    H = H / (2 * np.pi)  # Normalize to [0,1]
+    return np.stack((I, H, S), axis=-1)
+
+# --- IHS to RGB ---
+def ihs_to_rgb(ihs):
+    I, H, S = ihs[:, :, 0], ihs[:, :, 1], ihs[:, :, 2]
+    H = H * 2 * np.pi  # denormalize
+    R = np.zeros_like(I)
+    G = np.zeros_like(I)
+    B = np.zeros_like(I)
+
+    idx1 = (H < 2*np.pi/3)
+    idx2 = (H >= 2*np.pi/3) & (H < 4*np.pi/3)
+    idx3 = (H >= 4*np.pi/3)
+
+    R[idx1] = I[idx1] * (1 + (S[idx1] * np.cos(H[idx1])) / (np.cos(np.pi/3 - H[idx1]) + 1e-6))
+    B[idx1] = I[idx1] * (1 - S[idx1])
+    G[idx1] = 3*I[idx1] - (R[idx1] + B[idx1])
+
+    H2 = H[idx2] - 2*np.pi/3
+    R[idx2] = I[idx2] * (1 - S[idx2])
+    G[idx2] = I[idx2] * (1 + (S[idx2] * np.cos(H2)) / (np.cos(np.pi/3 - H2) + 1e-6))
+    B[idx2] = 3*I[idx2] - (R[idx2] + G[idx2])
+
+    H3 = H[idx3] - 4*np.pi/3
+    G[idx3] = I[idx3] * (1 - S[idx3])
+    B[idx3] = I[idx3] * (1 + (S[idx3] * np.cos(H3)) / (np.cos(np.pi/3 - H3) + 1e-6))
+    R[idx3] = 3*I[idx3] - (G[idx3] + B[idx3])
+
+    rgb = np.stack((R, G, B), axis=-1)
+    return np.clip(rgb, 0, 65535)
+
+# --- Load PAN ---
+pan_path = r"C:\Users\Dell\Desktop\newyork\LC08_L1TP_013032_20250323_20250331_02_T1_B8.TIF"
+pan_dataset = rasterio.open(pan_path)
+pan = pan_dataset.read(1)
+
+# --- Load and Resample MS Bands ---
+ms_paths = [
+    r"C:\Users\Dell\Desktop\newyork\LC08_L1TP_013032_20250323_20250331_02_T1_B2.TIF",  # Blue
+    r"C:\Users\Dell\Desktop\newyork\LC08_L1TP_013032_20250323_20250331_02_T1_B3.TIF",  # Green
+    r"C:\Users\Dell\Desktop\newyork\LC08_L1TP_013032_20250323_20250331_02_T1_B4.TIF"   # Red
+]
+ms_bands = []
+for path in ms_paths:
+    ms_dataset = rasterio.open(path)
+    ms_data = ms_dataset.read(1)
+    ms_resampled = np.empty(pan.shape, dtype=np.float32)
+    reproject(
+        source=ms_data,
+        destination=ms_resampled,
+        src_transform=ms_dataset.transform,
+        src_crs=ms_dataset.crs,
+        dst_transform=pan_dataset.transform,
+        dst_crs=pan_dataset.crs,
+        resampling=Resampling.bilinear
+    )
+    ms_bands.append(ms_resampled)
+ms_upsampled = np.stack(ms_bands, axis=-1)
+
+# --- Tiled Pansharpening ---
+tile_size = 512  # Adjust for memory
+height, width = pan.shape
+result = np.zeros((height, width, 3), dtype=np.float32)
+
+for y in range(0, height, tile_size):
+    for x in range(0, width, tile_size):
+        y_end = min(y + tile_size, height)
+        x_end = min(x + tile_size, width)
+
+        tile_rgb = ms_upsampled[y:y_end, x:x_end, :]
+        tile_pan = pan[y:y_end, x:x_end]
+
+        ihs = rgb_to_ihs(tile_rgb)
+        ihs[:, :, 0] = tile_pan  # Replace intensity
+        rgb_out = ihs_to_rgb(ihs)
+
+        result[y:y_end, x:x_end, :] = rgb_out
+
+# --- Display ---
+plt.figure(figsize=(12, 8))
+plt.imshow(result.astype(np.uint16))
+plt.title('Tiled IHS Pansharpened Image')
+plt.axis('off')
+plt.show()
+
+# --- Save pansharpened result ---
+output_path = r"C:\Users\Dell\Desktop\newyork\IHS_Pansharpened.tif"
+
+# Use metadata from PAN image
+meta = pan_dataset.meta.copy()
+meta.update({
+    "count": 3,
+    "dtype": "uint16"
+})
+
+with rasterio.open(output_path, 'w', **meta) as dst:
+    for i in range(3):  # Write each band
+        dst.write(result[:, :, i].astype('uint16'), i + 1)
+
+print(f"Pansharpened image saved to: {output_path}")
